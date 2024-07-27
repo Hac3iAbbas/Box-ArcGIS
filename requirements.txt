@@ -98,7 +98,6 @@ psutil==5.9.5
 pure_eval==0.2.2
 pycparser==2.21
 pydantic==2.1.1
-pydantic-core==2.2.0  # Updated to compatible version
 pydantic-extra-types==2.9.0
 pydantic-settings==2.3.4
 pydantic_core==2.4.0  # Example of a compatible version
