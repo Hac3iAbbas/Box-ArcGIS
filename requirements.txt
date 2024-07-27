@@ -100,7 +100,7 @@ pycparser==2.21
 pydantic==2.1.1
 pydantic-extra-types==2.9.0
 pydantic-settings==2.3.4
-pydantic-core==2.4.0  # Example of a compatible version
+pydantic-core==2.4.0
 Pygments==2.16.0
 pyparsing==3.1.0
 pyshp==2.3.1
@@ -112,7 +112,7 @@ python-dotenv==1.0.0
 python-json-logger==2.0.7
 python-multipart==0.0.5
 pytz==2023.3
-pywin32==306
+pywin32==305  # Updated version
 pywin32-ctypes==0.2.0
 pywinpty==2.0.11
 PyYAML==6.0
