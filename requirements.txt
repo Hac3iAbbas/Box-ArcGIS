@@ -30,7 +30,7 @@ email-validator==1.2.1
 exceptiongroup==1.1.1
 executing==2.0.1
 fastapi==0.103.0
-fastapi-cli==2.0.0
+fastapi-cli==0.0.4  
 fastjsonschema==2.20.0
 fonttools==4.53.1
 fqdn==1.5.1
