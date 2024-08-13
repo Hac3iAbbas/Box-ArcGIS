@@ -1,201 +1,169 @@
 import os
-import hmac
-import hashlib
-import requests
-import tempfile
-from fastapi import FastAPI, UploadFile, File, Request, HTTPException
-from boxsdk import OAuth2, Client
-from PIL import Image
-from PIL.ExifTags import TAGS, GPSTAGS
+import logging
+import json
+from fastapi import FastAPI, Request, HTTPException
+from boxsdk import JWTAuth, Client
 from dotenv import load_dotenv
+from pyproj import Transformer
+import httpx
+from crypto_utils import encrypt_token, decrypt_token, refresh_token  # Import the functions
+from jwt_utils import get_jwt_auth, get_jwt_client  # Import JWT utilities
+from utils import check_signature, classify_file  # Import utility functions
 
 load_dotenv()
 
 app = FastAPI()
 
-# Box API configuration
-BOX_CLIENT_ID = os.getenv('BOX_CLIENT_ID')
-BOX_CLIENT_SECRET = os.getenv('BOX_CLIENT_SECRET')
-BOX_REDIRECT_URI = os.getenv('BOX_REDIRECT_URI')
-BOX_DEVELOPER_TOKEN = os.getenv('BOX_DEVELOPER_TOKEN')
-BOX_FOLDER_ID = os.getenv('BOX_FOLDER_ID')
-BOX_WEBHOOK_SECRET = os.getenv('BOX_WEBHOOK_SECRET')
-
-# Initialize Box client with OAuth2 authentication
-auth = OAuth2(
-    client_id=BOX_CLIENT_ID,
-    client_secret=BOX_CLIENT_SECRET,
-    access_token=BOX_DEVELOPER_TOKEN
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),  # This logs to the console
+        logging.FileHandler('app.log')  # This logs to a file named app.log
+    ]
 )
-client = Client(auth)
+logger = logging.getLogger(__name__)
 
-def get_exif_data(image):
-    """
-    Extract Exchangeable Image File Format (EXIF) data from an image, specifically GPS information.
-    """
-    exif_data = {}
-    info = image._getexif()
-    if info:
-        for tag, value in info.items():
-            tag_name = TAGS.get(tag, tag)
-            if tag_name == "GPSInfo":
-                gps_data = {}
-                for gps_tag in value:
-                    gps_tag_name = GPSTAGS.get(gps_tag, gps_tag)
-                    gps_data[gps_tag_name] = value[gps_tag]
-                exif_data[tag_name] = gps_data
-            else:
-                exif_data[tag_name] = value
-    return exif_data
+# Box API configuration
+BOX_CONFIG_FILE = os.getenv('BOX_CONFIG_FILE')
 
-def get_lat_lon(exif_data):
-    """
-    Convert EXIF GPS data to latitude and longitude.
-    """
-    if "GPSInfo" in exif_data:
-        gps_info = exif_data["GPSInfo"]
-        gps_latitude = gps_info["GPSLatitude"]
-        gps_latitude_ref = gps_info["GPSLatitudeRef"]
-        gps_longitude = gps_info["GPSLongitude"]
-        gps_longitude_ref = gps_info["GPSLongitudeRef"]
+# Initialize Box client with JWT authentication
+auth = get_jwt_auth(BOX_CONFIG_FILE)
+client = get_jwt_client(BOX_CONFIG_FILE)
 
-        lat = convert_to_degrees(gps_latitude)
-        if gps_latitude_ref != "N":
-            lat = 0 - lat
+# Coordinate converter from 4326 to 3857 used by ArcGIS Online
+transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857")
 
-        lon = convert_to_degrees(gps_longitude)
-        if gps_longitude_ref != "E":
-            lon = 0 - lon
+# ArcGIS service URL from environment variable
+AGS_SERVICE_URL = os.getenv('AGS_SERVICE_URL')
 
-        return lat, lon
-    return None, None
+# Fernet key for encryption/decryption from environment variable
+FERNET_KEY = os.getenv('FERNET_KEY')
 
-def convert_to_degrees(value):
-    """
-    Convert GPS coordinates to degrees.
-    """
-    d = float(value[0])
-    m = float(value[1])
-    s = float(value[2])
-    return d + (m / 60.0) + (s / 3600.0)
+# Webhook secret from environment variable
+WEBHOOK_SECRET = os.getenv('BOX_WEBHOOK_SECRET')
 
-def verify_signature(payload, signature):
-    """
-    Verify the signature to ensure the request is from Box.
-    """
-    expected_signature = hmac.new(BOX_WEBHOOK_SECRET.encode(), str(payload).encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected_signature, signature)
-
-def download_and_process_file(download_url):
-    """
-    Download the file from Box and extract EXIF data.
-    """
-    headers = {'Authorization': f'Bearer {BOX_DEVELOPER_TOKEN}'}
+def check_file_exists(file_id):
     try:
-        response = requests.get(download_url, headers=headers)
-        response.raise_for_status()  # Raise an exception for HTTP errors
-        
-        # Use tempfile to create a temporary file location
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_file:
-            temp_file.write(response.content)
-            file_location = temp_file.name
-        
-        # Extract EXIF data
-        image = Image.open(file_location)
-        exif_data = get_exif_data(image)
-        latitude, longitude = get_lat_lon(exif_data)
-        
-        if latitude is not None and longitude is not None:
-            print(f"Latitude: {latitude}, Longitude: {longitude}")
-        else:
-            print("No latitude/longitude found")
-    
+        file_info = client.file(file_id).get()
+        logger.info(f"File exists: {file_info}")
+        return True
     except Exception as e:
-        print(f"Error downloading or processing file: {e}")
+        logger.error(f"Error checking file existence: {e}")
+        return False
 
-@app.get("/")
-async def read_root():
-    return {"message": "Hello World"}
-
-@app.get("/callback")
-async def callback(request: Request):
-    """
-    OAuth2 callback route to handle the authorization response from Box.
-    """
-    code = request.query_params.get('code')
-    if code:
-        # Exchange the authorization code for an access token
-        oauth2 = OAuth2(
-            client_id=BOX_CLIENT_ID,
-            client_secret=BOX_CLIENT_SECRET,
-            store_tokens=store_tokens,
-        )
-        access_token, refresh_token = oauth2.authenticate(code)
-        # You can now use the access token to make Box API calls
-        client = Client(oauth2)
-        # Do something with the client...
-        return {"status": "success", "access_token": access_token}
-    return {"status": "error", "message": "Authorization code not found"}
-
-def store_tokens(access_token, refresh_token):
-    # Store the tokens securely
-    print(f"Access Token: {access_token}")
-    print(f"Refresh Token: {refresh_token}")
-
-@app.post("/upload-file/")
-async def upload_file(file: UploadFile = File(...)):
-    """
-    Upload a new file to Box.
-    """
-    with tempfile.NamedTemporaryFile(delete=False, suffix=file.filename) as temp_file:
-        temp_file.write(await file.read())
-        temp_file_location = temp_file.name
-
-    box_folder = client.folder(BOX_FOLDER_ID)
-    box_file = box_folder.upload(temp_file_location)
-    
-    return {"filename": box_file.name, "id": box_file.id}
-
-@app.delete("/delete-file/{file_id}")
-async def delete_file(file_id: str):
-    """
-    Delete a file from Box using its file ID.
-    """
+def get_metadata(file_id):
     try:
-        client.file(file_id).delete()
-        return {"status": "File deleted successfully"}
+        # Fetch the file information with the specific metadata fields
+        file_info = client.file(file_id=file_id).get(fields=['id', 'type', 'name', 'metadata.global.boxCaptureV1'])
+        
+        # Extract the metadata from the response
+        metadata = file_info['metadata']['global']['boxCaptureV1']
+        
+        logger.info(f"Got metadata instance: {metadata}")
+        return metadata
+    except KeyError as e:
+        logger.error(f"Error fetching metadata: {e} - Key not found in the response.")
+        return None
     except Exception as e:
-        return {"status": "Error", "message": str(e)}
+        logger.error(f"Error fetching metadata: {e}")
+        return None
 
-@app.post("/restore-file/{file_id}")
-async def restore_file(file_id: str):
-    """
-    Restore a deleted file from the trash in Box using its file ID.
-    """
+async def add_feature_to_arcgis(x, y, attributes):
     try:
-        client.file(file_id).restore()
-        return {"status": "File restored successfully"}
+        features = [{
+            "geometry": {"x": x, "y": y},
+            "attributes": attributes
+        }]
+        data = {
+            "features": json.dumps(features),
+            "f": "json"
+        }
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(f"{AGS_SERVICE_URL}/addFeatures", data=data)
+            response.raise_for_status()
+            logger.info(f"ArcGIS add features response: {response.status_code} - {response.text}")
+            return response.json()
     except Exception as e:
-        return {"status": "Error", "message": str(e)}
+        logger.error(f"Error adding feature to ArcGIS: {e}")
+        return None
+
+async def delete_feature_from_arcgis(box_file_id):
+    try:
+        data = {
+            "where": f"BoxFileID='{box_file_id}'",
+            "f": "json"
+        }
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(f"{AGS_SERVICE_URL}/deleteFeatures", data=data)
+            response.raise_for_status()
+            logger.info(f"ArcGIS delete features response: {response.status_code} - {response.text}")
+            return response.json()
+    except Exception as e:
+        logger.error(f"Error deleting feature from ArcGIS: {e}")
+        return None
 
 @app.post("/webhook/box")
 async def handle_box_webhook(request: Request):
-    """
-    Handle Box webhook events.
-    Verify the payload and process upload events to extract coordinates.
-    """
     payload = await request.json()
-    signature = request.headers.get('Box-Signature')
-    if not verify_signature(payload, signature):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    signature = request.headers.get('box-signature')
+    logger.info(f"Received Payload: {payload}")
     
-    for event in payload['events']:
-        if event['event_type'] == 'UPLOAD':
-            file_id = event['source']['id']
-            download_url = f"https://api.box.com/2.0/files/{file_id}/content"
-            download_and_process_file(download_url)
-    
-    return {"status": "success"}
+    try:
+        # Check the signature of the webhook request
+        check_signature(WEBHOOK_SECRET, await request.body(), signature)
+
+        if payload.get('trigger') == 'FILE.UPLOADED':
+            file_id = payload['source']['id']
+            logger.info(f"Processing file ID: {file_id}")
+            if check_file_exists(file_id):
+                metadata = get_metadata(file_id)
+                if metadata:
+                    logger.info(f"Metadata: {metadata}")
+                    
+                    # Extract latitude and longitude
+                    latitude, _, longitude, _ = metadata['location'].split(' ')
+                    latitude = float(latitude)
+                    longitude = float(longitude)
+                    
+                    # Convert to x, y coordinates
+                    x, y = transformer.transform(latitude, -longitude)
+                    
+                    logger.info(f"Coordinates: x={x}, y={y}")
+                    
+                    # Encrypt file_id
+                    encrypted_file_id = encrypt_token(file_id, FERNET_KEY)
+                    
+                    # Add feature to ArcGIS
+                    attributes = {
+                        "BoxFileID": encrypted_file_id,
+                        "Latitude": latitude,
+                        "Longitude": longitude
+                    }
+                    arcgis_response = await add_feature_to_arcgis(x, y, attributes)
+                    
+                    # Classify the file
+                    classify_file(file_id, "Confidential", client)
+                    
+                    return {"x": x, "y": y, "arcgis_response": arcgis_response}
+        
+        elif payload.get('trigger') == 'FILE.TRASHED':
+            file_id = payload['source']['id']
+            logger.info(f"Processing file ID for deletion: {file_id}")
+            
+            # Encrypt file_id for deletion
+            encrypted_file_id = encrypt_token(file_id, FERNET_KEY)
+            
+            arcgis_response = await delete_feature_from_arcgis(encrypted_file_id)
+            return {"status": "success", "arcgis_response": arcgis_response}
+
+        return {"status": "success"}
+    except Exception as e:
+        logger.error(f"Error handling webhook event: {e}")
+        return {"status": "error", "message": "Failed to process webhook event"}
 
 if __name__ == "__main__":
     import uvicorn
